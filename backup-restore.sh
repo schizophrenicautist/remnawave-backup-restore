@@ -2,7 +2,7 @@
 
 set -e
 
-VERSION="3.2.3 (dev)"
+VERSION="3.2.2 (dev)"
 INSTALL_DIR="/opt/rw-backup-restore"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
@@ -1430,7 +1430,7 @@ cleanup_s3_old_backups() {
                AWS_DEFAULT_REGION="$S3_REGION" \
                aws s3 rm "s3://${S3_BUCKET}/${s3_prefix_arg}${file_name}" \
                $s3_endpoint_arg --quiet 2>/dev/null; then
-                ((deleted_count++))
+                ((deleted_count++)) || true
             fi
         fi
     done <<< "$file_list"
