@@ -1060,7 +1060,7 @@ create_panel_db_dump() {
     
     case "$DB_CONNECTION_TYPE" in
         docker)
-            if ! docker inspect remnawave-db > /dev/null 2>&1 || ! docker container inspect -f '{{.State.Running}}' remnawave-db 2>/dev/null | grep -q "true"; then
+            if [[ "$(docker inspect --format='{{.State.Running}}' remnawave-db 2>/dev/null)" != "true" ]]; then
                 LAST_DB_ERROR="$(t db_container_missing)"
                 print_message "ERROR" "$LAST_DB_ERROR"
                 return 1
@@ -1468,8 +1468,9 @@ create_backup() {
         print_message "INFO" "$(t bk_skip_panel)"
     else
         print_message "INFO" "$(t bk_creating_dump)"
-        if ! create_panel_db_dump "$BACKUP_DIR/$BACKUP_FILE_DB"; then
-            local STATUS=$?
+        create_panel_db_dump "$BACKUP_DIR/$BACKUP_FILE_DB"
+        local STATUS=$?
+        if [[ $STATUS -ne 0 ]]; then
             echo -e "${RED}❌ $(t bk_dump_err) ${BOLD}$STATUS${RESET}. $(t bk_check_db)${RESET}"
             local error_msg="❌ $(t bk_dump_err) ${STATUS}"
             if [[ -n "$LAST_DB_ERROR" ]]; then
