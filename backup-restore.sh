@@ -4,7 +4,7 @@ set -e
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
 
-VERSION="3.2.9 (dev)"
+VERSION="3.2.10 (dev)"
 INSTALL_DIR="/opt/rw-backup-restore"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
@@ -2984,7 +2984,45 @@ configure_settings() {
                                         print_message "SUCCESS" "$(t st_s3_test_ok)"
                                     else
                                         print_message "ERROR" "$(t st_s3_test_fail)"
-                                        echo -e "${YELLOW}Details: ${RED}${s3_test_output}${RESET}"
+                                        echo -e "${RED}──────────────────────────────────${RESET}"
+                                        if echo "$s3_test_output" | grep -q "SignatureDoesNotMatch"; then
+                                            echo -e "${RED}Invalid secret key${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Secret key is incorrect. Check and re-enter it${RESET}"
+                                        elif echo "$s3_test_output" | grep -q "Unauthorized"; then
+                                            echo -e "${RED}Unauthorized — secret key is incorrect${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Secret key is incorrect. Check and re-enter it${RESET}"
+                                        elif echo "$s3_test_output" | grep -q "InvalidArgument"; then
+                                            echo -e "${RED}Invalid access key format${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Access key length or format is incorrect${RESET}"
+                                        elif echo "$s3_test_output" | grep -q "InvalidAccessKeyId"; then
+                                            echo -e "${RED}Invalid access key${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Access key does not exist. Check and re-enter it${RESET}"
+                                        elif echo "$s3_test_output" | grep -q "AccessDenied"; then
+                                            echo -e "${RED}Access denied — key has no permission to list bucket objects${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Check S3 access key permissions (ListObjects required)${RESET}"
+                                        elif echo "$s3_test_output" | grep -q "NoSuchBucket"; then
+                                            echo -e "${RED}Bucket not found${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Bucket '${S3_BUCKET}' does not exist. Check bucket name${RESET}"
+                                        elif echo "$s3_test_output" | grep -q "SSL\|CERTIFICATE\|HANDSHAKE"; then
+                                            echo -e "${RED}SSL error — certificate is untrusted, expired or handshake failed${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Contact your S3 provider. The endpoint may use a self-signed certificate${RESET}"
+                                        elif echo "$s3_test_output" | grep -q "Could not connect\|ConnectionError\|EndpointResolutionError"; then
+                                            echo -e "${RED}Cannot reach S3 endpoint${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Check endpoint URL '${S3_ENDPOINT}' and network connectivity${RESET}"
+                                        else
+                                            echo -e "${RED}Unknown error${RESET}"
+                                            echo -e "${YELLOW}Details: ${s3_test_output}${RESET}"
+                                            echo -e "${GREEN}Hint: Check all S3 parameters and try again${RESET}"
+                                        fi
+                                        echo -e "${RED}──────────────────────────────────${RESET}"
                                     fi
                                 fi
                             fi
