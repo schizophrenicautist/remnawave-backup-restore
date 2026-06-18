@@ -79,16 +79,23 @@ t() {
 
 sync_bundled_translations() {
     local script_dir bundled
-    script_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
-    bundled="$script_dir/translations"
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    bundled="${script_dir}/translations"
+    if [[ "$script_dir" == "$INSTALL_DIR" ]]; then
+        return 0
+    fi
     if [[ ! -f "$bundled/en.sh" || ! -f "$bundled/ru.sh" ]]; then
         return 0
     fi
     mkdir -p "$TRANSLATIONS_DIR"
-    if [[ "$(realpath "$bundled")" == "$(realpath "$TRANSLATIONS_DIR")" ]]; then
+    if [[ "$bundled" == "$TRANSLATIONS_DIR" ]]; then
         return 0
     fi
-    cp -f "$bundled/en.sh" "$bundled/ru.sh" "$TRANSLATIONS_DIR/"
+    if [[ -f "$TRANSLATIONS_DIR/en.sh" ]] && [[ "$bundled/en.sh" -ef "$TRANSLATIONS_DIR/en.sh" ]]; then
+        return 0
+    fi
+    cp -f "$bundled/en.sh" "$TRANSLATIONS_DIR/en.sh"
+    cp -f "$bundled/ru.sh" "$TRANSLATIONS_DIR/ru.sh"
 }
 
 apply_tg_translation_defaults() {
@@ -1130,6 +1137,13 @@ load_or_create_config() {
 
             if mv "$SCRIPT_RUN_PATH" "$SCRIPT_PATH"; then
                 chmod +x "$SCRIPT_PATH"
+                local src_translations
+                src_translations="$(dirname "$SCRIPT_RUN_PATH")/translations"
+                if [[ -f "$src_translations/en.sh" && -f "$src_translations/ru.sh" ]]; then
+                    mkdir -p "$TRANSLATIONS_DIR"
+                    cp -f "$src_translations/en.sh" "$TRANSLATIONS_DIR/en.sh"
+                    cp -f "$src_translations/ru.sh" "$TRANSLATIONS_DIR/ru.sh"
+                fi
                 clear
                 print_message "SUCCESS" "Script successfully moved to ${BOLD}${SCRIPT_PATH}${RESET}."
                 print_message "ACTION" "Restarting script from new location to complete setup."
