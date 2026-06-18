@@ -1321,6 +1321,16 @@ restore_panel_db_dump() {
 }
 
 
+resolve_script_path() {
+    if [[ -x "$SCRIPT_PATH" ]]; then
+        echo "$SCRIPT_PATH"
+    elif [[ -n "$SCRIPT_RUN_PATH" && -x "$SCRIPT_RUN_PATH" ]]; then
+        echo "$SCRIPT_RUN_PATH"
+    else
+        realpath "${BASH_SOURCE[0]}"
+    fi
+}
+
 build_backup_inline_markup() {
     local extra_json="${1:-}"
     local btn_text
@@ -1346,12 +1356,15 @@ is_telegram_admin() {
     fi
     if [[ "$chat_id" =~ ^- ]]; then
         local response status
-        response=$(curl -s ${TG_PROXY:+--proxy "$TG_PROXY"}             "https://api.telegram.org/bot${BOT_TOKEN}/getChatMember"             -d "chat_id=${chat_id}"             -d "user_id=${user_id}")
+        response=$(curl -s ${TG_PROXY:+--proxy "$TG_PROXY"} \
+            "https://api.telegram.org/bot${BOT_TOKEN}/getChatMember" \
+            -d "chat_id=${chat_id}" \
+            -d "user_id=${user_id}")
         status=$(echo "$response" | jq -r '.result.status // empty')
         [[ "$status" == "creator" || "$status" == "administrator" ]] && return 0
         return 1
     fi
-    [[ "$user_id" == "$CHAT_ID" ]] && return 0
+    [[ "$user_id" == "${CHAT_ID// /}" ]] && return 0
     return 1
 }
 
@@ -1359,12 +1372,23 @@ answer_callback_query() {
     local callback_id="$1"
     local text="${2:-}"
     local show_alert="${3:-false}"
-    curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"}         "https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery"         -d "callback_query_id=${callback_id}"         ${text:+-d "text=${text}"}         -d "show_alert=${show_alert}" >/dev/null
+    if [[ -n "$text" ]]; then
+        curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
+            "https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery" \
+            --data-urlencode "callback_query_id=${callback_id}" \
+            --data-urlencode "text=${text}" \
+            --data-urlencode "show_alert=${show_alert}" >/dev/null
+    else
+        curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
+            "https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery" \
+            -d "callback_query_id=${callback_id}" \
+            -d "show_alert=${show_alert}" >/dev/null
+    fi
 }
 
 handle_telegram_callback() {
     local update="$1"
-    local callback_id user_id chat_id data
+    local callback_id user_id chat_id data script_path
     callback_id=$(echo "$update" | jq -r '.callback_query.id')
     user_id=$(echo "$update" | jq -r '.callback_query.from.id')
     chat_id=$(echo "$update" | jq -r '.callback_query.message.chat.id')
@@ -1376,22 +1400,32 @@ handle_telegram_callback() {
     fi
     answer_callback_query "$callback_id" "$(t tg_backup_started)" "false"
     send_telegram_message "🔄 $(t tg_backup_in_progress)" "None" >/dev/null 2>&1 || true
+    script_path=$(resolve_script_path)
     (
         export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
-        "$SCRIPT_PATH" backup
-    ) &
+        "$script_path" backup
+    ) >>"$INSTALL_DIR/tg_listener.log" 2>&1 &
 }
 
 telegram_listener_loop() {
+    set +e
+    mkdir -p "$INSTALL_DIR"
+    curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
+        "https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook" \
+        -d drop_pending_updates=false >/dev/null 2>&1
     local offset=0
     [[ -f "$TG_LISTENER_OFFSET_FILE" ]] && offset=$(cat "$TG_LISTENER_OFFSET_FILE" 2>/dev/null || echo 0)
     while true; do
-        local updates count i update update_id
+        local updates count i update update_id ok
         updates=$(curl -s ${TG_PROXY:+--proxy "$TG_PROXY"} \
             "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates" \
             -d "offset=${offset}" \
-            -d "timeout=25" \
-            -d 'allowed_updates=["callback_query"]')
+            -d "timeout=25")
+        ok=$(echo "$updates" | jq -r '.ok // false')
+        if [[ "$ok" != "true" ]]; then
+            sleep 5
+            continue
+        fi
         count=$(echo "$updates" | jq -r '.result | length // 0')
         [[ "$count" == "0" || -z "$count" ]] && continue
         for ((i = 0; i < count; i++)); do
@@ -1408,18 +1442,20 @@ telegram_listener_loop() {
 
 ensure_telegram_listener() {
     [[ -z "$BOT_TOKEN" ]] && return 0
+    mkdir -p "$INSTALL_DIR"
+    local script_path listener_log pid
+    script_path=$(resolve_script_path)
+    listener_log="$INSTALL_DIR/tg_listener.log"
     if [[ -f "$TG_LISTENER_PID_FILE" ]]; then
-        local pid
         pid=$(cat "$TG_LISTENER_PID_FILE" 2>/dev/null)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             return 0
         fi
+        rm -f "$TG_LISTENER_PID_FILE"
     fi
-    (
-        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
-        RW_RUNNING_MODE="listen"
-        "$SCRIPT_PATH" listen
-    ) >>"$INSTALL_DIR/tg_listener.log" 2>&1 &
+    nohup env RW_RUNNING_MODE=listen \
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH" \
+        "$script_path" listen >>"$listener_log" 2>&1 &
     echo $! >"$TG_LISTENER_PID_FILE"
 }
 
@@ -2138,7 +2174,7 @@ setup_auto_send() {
                 save_config
                 print_message "SUCCESS" "$(t cron_disabled)"
                 ;;
-            0) break ;;
+            3|0) break ;;
             *) print_message "ERROR" "$(t invalid_input_select)" ;;
         esac
         echo ""
@@ -2936,7 +2972,7 @@ configure_upload_method() {
                     print_message "SUCCESS" "$(t ul_tg_set)"
                 fi
                 ;;
-            4) break ;;
+            4|0) break ;;
             *) print_message "ERROR" "$(t invalid_input_select)" ;;
         esac
         echo ""
@@ -2948,18 +2984,17 @@ configure_upload_method() {
 configure_settings() {
     while true; do
         ui_header "$(t st_title)"
-        echo "   1. $(t st_tg_settings)"
-        echo "   2. $(t st_gd_settings)"
-        echo "   3. $(t st_s3_settings)"
-        echo "   4. $(t st_db_settings)"
-        echo "   5. $(t st_path_settings)"
-        echo "   6. $(t st_retention_settings)"
-        echo "   7. $(t st_lang)"
-        echo "   8. $(t st_auto_update)"
-        echo ""
-        echo "   0. $(t back_to_menu)"
-        echo ""
-        read -rp "${GREEN}[?]${RESET} $(t select_option)" choice
+        local choice
+        choice=$(ui_pick_index "$(t select_option)" \
+            "$(t st_tg_settings)" \
+            "$(t st_gd_settings)" \
+            "$(t st_s3_settings)" \
+            "$(t st_db_settings)" \
+            "$(t st_path_settings)" \
+            "$(t st_retention_settings)" \
+            "$(t st_lang)" \
+            "$(t st_auto_update)" \
+            "$(t back_to_menu)")
         echo ""
 
         case $choice in
@@ -2992,6 +3027,8 @@ configure_settings() {
                             read -rp "   $(t st_tg_enter_token)" NEW_BOT_TOKEN
                             BOT_TOKEN="$NEW_BOT_TOKEN"
                             save_config
+                            stop_telegram_listener
+                            ensure_telegram_listener
                             print_message "SUCCESS" "$(t st_tg_token_ok)"
                             ;;
                         2)
@@ -3510,7 +3547,7 @@ configure_settings() {
                 ui_pause
                 ;;
 
-            9) break ;;
+            9|0) break ;;
             *) print_message "ERROR" "$(t invalid_input_select)" ;;
         esac
         echo ""
@@ -3635,6 +3672,8 @@ fi
 if [[ -z "$1" ]]; then
     ensure_gum
     load_or_create_config
+    stop_telegram_listener
+    ensure_telegram_listener
     setup_symlink
     main_menu
 elif [[ "$1" == "backup" ]]; then
