@@ -81,10 +81,14 @@ sync_bundled_translations() {
     local script_dir bundled
     script_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
     bundled="$script_dir/translations"
-    if [[ -f "$bundled/en.sh" && -f "$bundled/ru.sh" ]]; then
-        mkdir -p "$TRANSLATIONS_DIR"
-        cp -f "$bundled/en.sh" "$bundled/ru.sh" "$TRANSLATIONS_DIR/"
+    if [[ ! -f "$bundled/en.sh" || ! -f "$bundled/ru.sh" ]]; then
+        return 0
     fi
+    mkdir -p "$TRANSLATIONS_DIR"
+    if [[ "$(realpath "$bundled")" == "$(realpath "$TRANSLATIONS_DIR")" ]]; then
+        return 0
+    fi
+    cp -f "$bundled/en.sh" "$bundled/ru.sh" "$TRANSLATIONS_DIR/"
 }
 
 apply_tg_translation_defaults() {
