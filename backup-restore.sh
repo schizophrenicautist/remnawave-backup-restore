@@ -4,7 +4,7 @@ set -e
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
 
-VERSION="3.2.4"
+VERSION="3.3.0"
 INSTALL_DIR="/opt/rw-backup-restore"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
@@ -37,6 +37,10 @@ DB_POSTGRES_VERSION="17"
 CRON_TIMES=""
 TG_MESSAGE_THREAD_ID=""
 TG_PROXY=""
+TG_ADMIN_IDS=""
+TG_CALLBACK_BACKUP="rw_backup_now"
+TG_LISTENER_OFFSET_FILE="$INSTALL_DIR/.tg_listener_offset"
+TG_LISTENER_PID_FILE="$INSTALL_DIR/.tg_listener.pid"
 UPDATE_AVAILABLE=false
 AUTO_UPDATE="false"
 BACKUP_EXCLUDE_PATTERNS="*.log *.tmp .git"
@@ -49,25 +53,18 @@ BOT_BACKUP_SELECTED=""
 BOT_BACKUP_DB_USER="postgres"
 
 
-if [[ -t 0 ]]; then
-    RED=$'\e[31m'
-    GREEN=$'\e[32m'
-    YELLOW=$'\e[33m'
-    GRAY=$'\e[37m'
-    LIGHT_GRAY=$'\e[90m'
-    CYAN=$'\e[36m'
-    RESET=$'\e[0m'
-    BOLD=$'\e[1m'
-else
-    RED=""
-    GREEN=""
-    YELLOW=""
-    GRAY=""
-    LIGHT_GRAY=""
-    CYAN=""
-    RESET=""
-    BOLD=""
-fi
+RW_RUNNING_MODE=""
+UI_INTERACTIVE=false
+[[ -t 0 && -t 1 ]] && UI_INTERACTIVE=true
+
+RED=$'\e[31m'
+GREEN=$'\e[32m'
+YELLOW=$'\e[33m'
+GRAY=$'\e[37m'
+LIGHT_GRAY=$'\e[90m'
+CYAN=$'\e[36m'
+RESET=$'\e[0m'
+BOLD=$'\e[1m'
 
 declare -A L
 
@@ -77,6 +74,156 @@ t() {
         echo "${L[$key]}"
     else
         echo "$key"
+    fi
+}
+
+ui_can_gum() {
+    $UI_INTERACTIVE && command -v gum &>/dev/null
+}
+
+ensure_gum() {
+    command -v gum &>/dev/null && return 0
+    if [[ $EUID -ne 0 ]]; then
+        print_message "ERROR" "$(t gum_root)"
+        exit 1
+    fi
+    print_message "INFO" "$(t gum_installing)"
+    if command -v apt-get &>/dev/null; then
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://repo.charm.sh/apt/gpg.key | gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null || true
+        echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" > /etc/apt/sources.list.d/charm.list
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y gum >/dev/null 2>&1 || { print_message "ERROR" "$(t gum_fail)"; exit 1; }
+    elif command -v dnf &>/dev/null; then
+        echo '[charm]
+name=Charm
+baseurl=https://repo.charm.sh/yum/
+enabled=1
+gpgcheck=1
+gpgkey=https://repo.charm.sh/yum/gpg.key' > /etc/yum.repos.d/charm.repo
+        rpm --import https://repo.charm.sh/yum/gpg.key 2>/dev/null || true
+        dnf install -y gum >/dev/null 2>&1 || { print_message "ERROR" "$(t gum_fail)"; exit 1; }
+    else
+        print_message "ERROR" "$(t gum_no_pkg)"
+        exit 1
+    fi
+    print_message "SUCCESS" "$(t gum_installed)"
+}
+
+ui_header() {
+    local title="$1"
+    ui_clear
+    if ui_can_gum; then
+        gum style --border double --border-foreground 212 --padding "1 2" --margin "1 0" --bold "$title"
+    else
+        echo -e "${GREEN}${BOLD}${title}${RESET}"
+    fi
+    echo ""
+}
+
+ui_clear() {
+    $UI_INTERACTIVE && clear || true
+}
+
+ui_pause() {
+    local msg="${1:-$(t press_enter)}"
+    if ui_can_gum; then
+        gum confirm "$msg" --default=true --affirmative "Enter" --negative "" || true
+    else
+        read -rp "$msg"
+    fi
+}
+
+ui_input() {
+    local placeholder="$1"
+    local secret="${2:-false}"
+    if ui_can_gum; then
+        if [[ "$secret" == "true" ]]; then
+            gum input --password --placeholder "$placeholder"
+        else
+            gum input --placeholder "$placeholder"
+        fi
+    else
+        local val
+        if [[ "$secret" == "true" ]]; then
+            read -rsp "$placeholder: " val
+            echo ""
+        else
+            read -rp "$placeholder: " val
+        fi
+        echo "$val"
+    fi
+}
+
+ui_confirm() {
+    local prompt="$1"
+    if ui_can_gum; then
+        gum confirm "$prompt"
+    else
+        local ans
+        read -rp "$prompt [Y/n]: " ans
+        [[ "${ans:-y}" =~ ^[Yy] ]]
+    fi
+}
+
+ui_choose() {
+    local header="${1:-$(t select_option)}"
+    shift
+    local -a opts=("$@")
+    if ui_can_gum; then
+        gum choose --header "$header" "${opts[@]}"
+    else
+        local i=1 opt
+        for opt in "${opts[@]}"; do
+            echo " $i) $opt"
+            ((i++))
+        done
+        local n
+        read -rp "[?] $header: " n
+        echo "${opts[$((n - 1))]}"
+    fi
+}
+
+ui_pick_index() {
+    local header="${1:-$(t select_option)}"
+    shift
+    local -a opts=("$@")
+    if ui_can_gum; then
+        local picked i
+        picked=$(gum choose --header "$header" "${opts[@]}")
+        for i in "${!opts[@]}"; do
+            [[ "${opts[$i]}" == "$picked" ]] && { echo "$((i + 1))"; return; }
+        done
+        echo "0"
+    else
+        local i=1 opt
+        for opt in "${opts[@]}"; do
+            echo " $i) $opt"
+            ((i++))
+        done
+        local n
+        read -rp "[?] $header: " n
+        echo "$n"
+    fi
+}
+
+ui_spin() {
+    local title="$1"
+    shift
+    if ui_can_gum; then
+        gum spin --spinner dot --title "$title" --show-output -- "$@"
+    else
+        print_message "INFO" "$title"
+        "$@"
+    fi
+}
+
+ui_format() {
+    local text="$1"
+    if ui_can_gum; then
+        printf '%s\n' "$text" | gum format
+    else
+        echo -e "$text"
     fi
 }
 
@@ -102,14 +249,10 @@ load_language() {
 
 select_language_interactive() {
     echo ""
-    echo "Select language / Выберите язык:"
-    echo " 1. Русский"
-    echo " 2. English"
-    echo ""
-    local lang_choice
-    read -rp " [?]: " lang_choice
-    case "$lang_choice" in
-        2) LANG_CODE="en" ;;
+    local picked
+    picked=$(ui_choose "Select language / Выберите язык" "Русский" "English")
+    case "$picked" in
+        *English*) LANG_CODE="en" ;;
         *) LANG_CODE="ru" ;;
     esac
     load_language "$LANG_CODE"
@@ -118,19 +261,26 @@ select_language_interactive() {
 print_message() {
     local type="$1"
     local message="$2"
-    local color_code="$RESET"
-
+    local level="info"
     case "$type" in
-        "INFO") color_code="$GRAY" ;;
-        "SUCCESS") color_code="$GREEN" ;;
-        "WARN") color_code="$YELLOW" ;;
-        "ERROR") color_code="$RED" ;;
-        "ACTION") color_code="$CYAN" ;;
-        "LINK") color_code="$CYAN" ;;
-        *) type="INFO" ;;
+        SUCCESS) level="info" ;;
+        WARN) level="warn" ;;
+        ERROR) level="error" ;;
+        ACTION|LINK) level="debug" ;;
+        *) level="info" ;;
     esac
-
-    echo -e "${color_code}[$type]${RESET} $message"
+    if ui_can_gum; then
+        gum log --level "$level" "$message"
+    else
+        local color_code="$GRAY"
+        case "$type" in
+            SUCCESS) color_code="$GREEN" ;;
+            WARN) color_code="$YELLOW" ;;
+            ERROR) color_code="$RED" ;;
+            ACTION|LINK) color_code="$CYAN" ;;
+        esac
+        echo -e "${color_code}[$type]${RESET} $message"
+    fi
 }
 
 setup_symlink() {
@@ -164,9 +314,7 @@ setup_symlink() {
 
 configure_bot_backup() {
     while true; do
-        clear
-        echo -e "${GREEN}${BOLD}$(t bot_cfg_title)${RESET}"
-        echo ""
+        ui_header "$(t bot_cfg_title)"
         
         if [[ "$BOT_BACKUP_ENABLED" == "true" ]]; then
             echo -e "  $(t bot_label)      ${BOLD}${GREEN}${BOT_BACKUP_SELECTED}${RESET}"
@@ -274,7 +422,7 @@ configure_bot_backup() {
                 BOT_BACKUP_ENABLED="true"
                 save_config
                 print_message "SUCCESS" "$(t bot_saved)"
-                read -rp "$(t press_enter)"
+                ui_pause
                 ;;
 
             2)
@@ -295,7 +443,7 @@ configure_bot_backup() {
                 fi
                 
                 save_config
-                read -rp "$(t press_enter)"
+                ui_pause
                 ;;
 
             3)
@@ -307,7 +455,7 @@ configure_bot_backup() {
                     print_message "SUCCESS" "$(t bot_mode_to_only_bot)"
                 fi
                 save_config
-                read -rp "$(t press_enter)"
+                ui_pause
                 ;;
 
             0) break ;;
@@ -503,14 +651,14 @@ restore_bot_backup() {
             if [[ -z "$custom_restore_path" ]]; then
                 print_message "ERROR" "$(t rbot_path_empty)"
                 echo ""
-                read -rp "$(t press_enter)"
+                ui_pause
                 continue
             fi
         
             if [[ ! "$custom_restore_path" = /* ]]; then
                 print_message "ERROR" "$(t rbot_path_abs)"
                 echo ""
-                read -rp "$(t press_enter)"
+                ui_pause
                 continue
             fi
         
@@ -679,7 +827,7 @@ restore_bot_backup() {
             fi
             [[ -d "$temp_restore_dir" ]] && rm -rf "$temp_restore_dir"
             echo ""
-            read -rp "$(t press_enter_back)"
+            ui_pause "$(t press_enter_back)"
             return 1
         fi
 
@@ -722,6 +870,7 @@ CRON_TIMES="$CRON_TIMES"
 REMNALABS_ROOT_DIR="$REMNALABS_ROOT_DIR"
 TG_MESSAGE_THREAD_ID="$TG_MESSAGE_THREAD_ID"
 TG_PROXY="$TG_PROXY"
+TG_ADMIN_IDS="$TG_ADMIN_IDS"
 BOT_BACKUP_ENABLED="$BOT_BACKUP_ENABLED"
 BOT_BACKUP_PATH="$BOT_BACKUP_PATH"
 BOT_BACKUP_SELECTED="$BOT_BACKUP_SELECTED"
@@ -753,6 +902,7 @@ load_or_create_config() {
         REMNALABS_ROOT_DIR=${REMNALABS_ROOT_DIR:-}
         TG_MESSAGE_THREAD_ID=${TG_MESSAGE_THREAD_ID:-}
         TG_PROXY=${TG_PROXY:-}
+        TG_ADMIN_IDS=${TG_ADMIN_IDS:-}
         SKIP_PANEL_BACKUP=${SKIP_PANEL_BACKUP:-false}
         DB_CONNECTION_TYPE=${DB_CONNECTION_TYPE:-docker}
         DB_HOST=${DB_HOST:-}
@@ -817,14 +967,14 @@ load_or_create_config() {
                     if [[ -z "$custom_remnawave_path" ]]; then
                         print_message "ERROR" "$(t cfg_path_empty)"
                         echo ""
-                        read -rp "$(t press_enter)"
+                        ui_pause
                         continue
                     fi
     
                     if [[ ! "$custom_remnawave_path" = /* ]]; then
                         print_message "ERROR" "$(t cfg_path_abs)"
                         echo ""
-                        read -rp "$(t press_enter)"
+                        ui_pause
                         continue
                     fi
     
@@ -835,7 +985,7 @@ load_or_create_config() {
                         read -rp "$(echo -e "${GREEN}[?]${RESET} $(t cfg_continue_path) ${GREEN}${BOLD}Y${RESET}/${RED}${BOLD}N${RESET}: ")" confirm_custom_path
                         if [[ "$confirm_custom_path" != "y" ]]; then
                             echo ""
-                            read -rp "$(t press_enter)"
+                            ui_pause
                             continue
                         fi
                     fi
@@ -1021,6 +1171,10 @@ load_or_create_config() {
         fi
     fi
 
+    if [[ "$RW_RUNNING_MODE" != "listen" && -n "$BOT_TOKEN" ]]; then
+        ensure_telegram_listener
+    fi
+
     echo ""
 }
 
@@ -1166,9 +1320,125 @@ restore_panel_db_dump() {
     return 0
 }
 
+
+build_backup_inline_markup() {
+    local extra_json="${1:-}"
+    local btn_text
+    btn_text=$(t tg_btn_backup_now)
+    if [[ -n "$extra_json" ]]; then
+        jq -n             --arg text "$btn_text"             --arg data "$TG_CALLBACK_BACKUP"             --argjson extra "$extra_json"             '($extra.inline_keyboard // []) + [[{text: $text, callback_data: $data}]] | {inline_keyboard: .}'
+    else
+        jq -n             --arg text "$btn_text"             --arg data "$TG_CALLBACK_BACKUP"             '{inline_keyboard: [[{text: $text, callback_data: $data}]]}'
+    fi
+}
+
+is_telegram_admin() {
+    local user_id="$1"
+    local chat_id="$2"
+    if [[ -n "$TG_ADMIN_IDS" ]]; then
+        local id
+        IFS=',' read -ra admin_list <<< "$TG_ADMIN_IDS"
+        for id in "${admin_list[@]}"; do
+            id="${id// /}"
+            [[ -n "$id" && "$id" == "$user_id" ]] && return 0
+        done
+        return 1
+    fi
+    if [[ "$chat_id" =~ ^- ]]; then
+        local response status
+        response=$(curl -s ${TG_PROXY:+--proxy "$TG_PROXY"}             "https://api.telegram.org/bot${BOT_TOKEN}/getChatMember"             -d "chat_id=${chat_id}"             -d "user_id=${user_id}")
+        status=$(echo "$response" | jq -r '.result.status // empty')
+        [[ "$status" == "creator" || "$status" == "administrator" ]] && return 0
+        return 1
+    fi
+    [[ "$user_id" == "$CHAT_ID" ]] && return 0
+    return 1
+}
+
+answer_callback_query() {
+    local callback_id="$1"
+    local text="${2:-}"
+    local show_alert="${3:-false}"
+    curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"}         "https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery"         -d "callback_query_id=${callback_id}"         ${text:+-d "text=${text}"}         -d "show_alert=${show_alert}" >/dev/null
+}
+
+handle_telegram_callback() {
+    local update="$1"
+    local callback_id user_id chat_id data
+    callback_id=$(echo "$update" | jq -r '.callback_query.id')
+    user_id=$(echo "$update" | jq -r '.callback_query.from.id')
+    chat_id=$(echo "$update" | jq -r '.callback_query.message.chat.id')
+    data=$(echo "$update" | jq -r '.callback_query.data')
+    [[ "$data" != "$TG_CALLBACK_BACKUP" ]] && return
+    if ! is_telegram_admin "$user_id" "$chat_id"; then
+        answer_callback_query "$callback_id" "$(t tg_admin_denied)" "true"
+        return
+    fi
+    answer_callback_query "$callback_id" "$(t tg_backup_started)" "false"
+    send_telegram_message "🔄 $(t tg_backup_in_progress)" "None" >/dev/null 2>&1 || true
+    (
+        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
+        "$SCRIPT_PATH" backup
+    ) &
+}
+
+telegram_listener_loop() {
+    local offset=0
+    [[ -f "$TG_LISTENER_OFFSET_FILE" ]] && offset=$(cat "$TG_LISTENER_OFFSET_FILE" 2>/dev/null || echo 0)
+    while true; do
+        local updates count i update update_id
+        updates=$(curl -s ${TG_PROXY:+--proxy "$TG_PROXY"} \
+            "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates" \
+            -d "offset=${offset}" \
+            -d "timeout=25" \
+            -d 'allowed_updates=["callback_query"]')
+        count=$(echo "$updates" | jq -r '.result | length // 0')
+        [[ "$count" == "0" || -z "$count" ]] && continue
+        for ((i = 0; i < count; i++)); do
+            update=$(echo "$updates" | jq -c ".result[$i]")
+            update_id=$(echo "$update" | jq -r '.update_id')
+            offset=$((update_id + 1))
+            echo "$offset" > "$TG_LISTENER_OFFSET_FILE"
+            if echo "$update" | jq -e '.callback_query' >/dev/null 2>&1; then
+                handle_telegram_callback "$update"
+            fi
+        done
+    done
+}
+
+ensure_telegram_listener() {
+    [[ -z "$BOT_TOKEN" ]] && return 0
+    if [[ -f "$TG_LISTENER_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$TG_LISTENER_PID_FILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    (
+        export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
+        RW_RUNNING_MODE="listen"
+        "$SCRIPT_PATH" listen
+    ) >>"$INSTALL_DIR/tg_listener.log" 2>&1 &
+    echo $! >"$TG_LISTENER_PID_FILE"
+}
+
+stop_telegram_listener() {
+    if [[ -f "$TG_LISTENER_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$TG_LISTENER_PID_FILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$TG_LISTENER_PID_FILE"
+    fi
+    rm -f "$TG_LISTENER_OFFSET_FILE"
+}
+
 send_telegram_message() {
     local message="$1"
     local parse_mode="${2:-MarkdownV2}"
+    local extra_markup="${3:-}"
 
     if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
         return 1
@@ -1176,6 +1446,8 @@ send_telegram_message() {
 
     local url="https://api.telegram.org/bot$BOT_TOKEN/sendMessage"
     local send_text="$message"
+    local reply_markup
+    reply_markup=$(build_backup_inline_markup "$extra_markup")
 
     if [[ "$parse_mode" == "MarkdownV2" ]]; then
         send_text=$(escape_markdown_v2 "$message")
@@ -1184,6 +1456,7 @@ send_telegram_message() {
     local data_params=(
         -d chat_id="$CHAT_ID"
         -d text="$send_text"
+        -d reply_markup="$reply_markup"
     )
 
     if [[ -n "$parse_mode" && "$parse_mode" != "None" ]]; then
@@ -1200,7 +1473,7 @@ send_telegram_message() {
     if [[ "$http_code" -eq 200 ]]; then
         return 0
     else
-        response=$(curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} "$url" -d chat_id="$CHAT_ID" -d text="$message" -w "\n%{http_code}")
+        response=$(curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} "$url"             -d chat_id="$CHAT_ID"             -d text="$message"             -d reply_markup="$reply_markup"             -w "\n%{http_code}")
         http_code=$(echo "$response" | tail -n1)
         if [[ "$http_code" -eq 200 ]]; then
             return 0
@@ -1222,11 +1495,15 @@ send_telegram_document() {
         return 1
     fi
 
+    local reply_markup
+    reply_markup=$(build_backup_inline_markup)
+
     local form_params=(
         -F chat_id="$CHAT_ID"
         -F document=@"$file_path"
         -F parse_mode="$parse_mode"
         -F caption="$escaped_caption"
+        -F reply_markup="$reply_markup"
     )
 
     if [[ -n "$TG_MESSAGE_THREAD_ID" ]]; then
@@ -1689,7 +1966,9 @@ METAEOF
                             
                             local auto_update_msg="✅ *$(t tg_auto_updated)* ${CURRENT_VERSION} *$(t tg_auto_updated_to)* ${REMOTE_VERSION_LATEST}"
                             local release_url="https://github.com/distillium/remnawave-backup-restore/releases/tag/${REMOTE_VERSION_LATEST}"
-                            local keyboard="{\"inline_keyboard\":[[{\"text\":\"$(t tg_auto_update_changelog)\",\"url\":\"${release_url}\"}]]}"
+                            local extra_kb keyboard
+                            extra_kb=$(jq -n --arg text "$(t tg_auto_update_changelog)" --arg url "${release_url}" '{inline_keyboard: [[{text: $text, url: $url}]]}')
+                            keyboard=$(build_backup_inline_markup "$extra_kb")
 
                             curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
                                 -d "chat_id=${CHAT_ID}" \
@@ -1715,24 +1994,18 @@ setup_auto_send() {
     echo ""
     if [[ $EUID -ne 0 ]]; then
         print_message "WARN" "$(t cron_root)"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     fi
     while true; do
-        clear
-        echo -e "${GREEN}${BOLD}$(t cron_title)${RESET}"
-        echo ""
+        ui_header "$(t cron_title)"
         if [[ -n "$CRON_TIMES" ]]; then
             print_message "INFO" "$(t cron_on) ${BOLD}${CRON_TIMES}${RESET} $(t cron_utc)"
         else
             print_message "INFO" "$(t cron_off)"
         fi
-        echo ""
-        echo "   1. $(t cron_enable)"
-        echo "   2. $(t cron_disable)"
-        echo "   0. $(t back_to_menu)"
-        echo ""
-        read -rp "${GREEN}[?]${RESET} $(t select_option)" choice
+        local choice
+        choice=$(ui_pick_index "$(t select_option)" "$(t cron_enable)" "$(t cron_disable)" "$(t back_to_menu)")
         echo ""
         case $choice in
             1)
@@ -1869,7 +2142,7 @@ setup_auto_send() {
             *) print_message "ERROR" "$(t invalid_input_select)" ;;
         esac
         echo ""
-        read -rp "$(t press_enter)"
+        ui_pause
     done
     echo ""
 }
@@ -1923,7 +2196,7 @@ restore_backup() {
 
                 if [[ -z "$rs_s3_bucket" || -z "$rs_s3_access" || -z "$rs_s3_secret" || -z "$rs_s3_endpoint" ]]; then
                     print_message "ERROR" "$(t ul_s3_fail)"
-                    read -rp "$(t press_enter_back)"
+                    ui_pause "$(t press_enter_back)"
                     return
                 fi
             fi
@@ -1931,7 +2204,7 @@ restore_backup() {
             if ! command -v aws &> /dev/null; then
                 if ! install_aws_cli; then
                     print_message "ERROR" "$(t s3_aws_not_found)"
-                    read -rp "$(t press_enter_back)"
+                    ui_pause "$(t press_enter_back)"
                     return
                 fi
             fi
@@ -1950,7 +2223,7 @@ restore_backup() {
 
             if [[ -z "$s3_file_list" ]]; then
                 print_message "ERROR" "$(t rs_s3_no_files)"
-                read -rp "$(t press_enter_back)"
+                ui_pause "$(t press_enter_back)"
                 return
             fi
 
@@ -2003,7 +2276,7 @@ restore_backup() {
             S3_RESTORE_BUCKET="$rs_s3_bucket"
             ;;
         1) ;;
-        *) print_message "ERROR" "$(t invalid_input_select)"; read -rp "$(t press_enter)"; return ;;
+        *) print_message "ERROR" "$(t invalid_input_select)"; ui_pause; return ;;
     esac
 
     local temp_restore_dir="$BACKUP_DIR/restore_temp_$$"
@@ -2020,7 +2293,7 @@ restore_backup() {
              $S3_RESTORE_ENDPOINT_ARG 2>/dev/null | tar -xzf - -C "$temp_restore_dir"; then
             print_message "ERROR" "$(t rs_s3_stream_err)"
             rm -rf "$temp_restore_dir"
-            read -rp "$(t press_enter_back)"
+            ui_pause "$(t press_enter_back)"
             return
         fi
 
@@ -2033,7 +2306,7 @@ restore_backup() {
         if ! compgen -G "$BACKUP_DIR/remnawave_backup_*.tar.gz" > /dev/null; then
             print_message "ERROR" "$(t rs_no_files) ${BOLD}${BACKUP_DIR}${RESET}."
             rm -rf "$temp_restore_dir"
-            read -rp "$(t press_enter_back)"
+            ui_pause "$(t press_enter_back)"
             return
         fi
 
@@ -2070,7 +2343,7 @@ restore_backup() {
         if ! tar -xzf "$SELECTED_BACKUP" -C "$temp_restore_dir"; then
             print_message "ERROR" "$(t rs_unpack_err)"
             rm -rf "$temp_restore_dir"
-            read -rp "$(t press_enter_back)"
+            ui_pause "$(t press_enter_back)"
             return
         fi
 
@@ -2156,7 +2429,7 @@ restore_backup() {
                     else
                         print_message "ERROR" "$(t rs_conn_fail)"
                         rm -rf "$temp_restore_dir"
-                        read -rp "$(t press_enter_back)"
+                        ui_pause "$(t press_enter_back)"
                         return
                     fi
                     ;;
@@ -2167,7 +2440,7 @@ restore_backup() {
                 0|*)
                     print_message "INFO" "$(t rs_cancelled)"
                     rm -rf "$temp_restore_dir"
-                    read -rp "$(t press_enter_back)"
+                    ui_pause "$(t press_enter_back)"
                     return
                     ;;
             esac
@@ -2179,7 +2452,7 @@ restore_backup() {
             if [[ ! "$compat_confirm" =~ ^[yY]$ ]]; then
                 print_message "INFO" "$(t rs_cancelled)"
                 rm -rf "$temp_restore_dir"
-                read -rp "$(t press_enter_back)"
+                ui_pause "$(t press_enter_back)"
                 return
             fi
         fi
@@ -2257,7 +2530,7 @@ restore_backup() {
                     pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" 2>/dev/null; then
                     print_message "ERROR" "$(t rs_ext_unavail) (${DB_HOST}:${DB_PORT}). $(t rs_check_conn)"
                     rm -rf "$temp_restore_dir"
-                    read -rp "$(t press_enter_back)"
+                    ui_pause "$(t press_enter_back)"
                     return 1
                 fi
                 print_message "SUCCESS" "$(t rs_ext_ok)"
@@ -2273,7 +2546,7 @@ restore_backup() {
                 print_message "ERROR" "$(t rs_db_err)"
                 [[ -f "$restore_log" ]] && cat "$restore_log"
                 rm -rf "$temp_restore_dir"
-                read -rp "$(t press_enter_back)"
+                ui_pause "$(t press_enter_back)"
                 return 1
             fi
 
@@ -2289,7 +2562,7 @@ restore_backup() {
                 else
                     print_message "ERROR" "$(t rs_panel_fail)"
                     rm -rf "$temp_restore_dir"
-                    read -rp "$(t press_enter_back)"
+                    ui_pause "$(t press_enter_back)"
                     return 1
                 fi
             else
@@ -2301,7 +2574,7 @@ restore_backup() {
                 else
                     print_message "ERROR" "$(t rs_panel_fail)"
                     rm -rf "$temp_restore_dir"
-                    read -rp "$(t press_enter_back)"
+                    ui_pause "$(t press_enter_back)"
                     return 1
                 fi
             fi
@@ -2344,7 +2617,7 @@ restore_backup() {
 
     print_message "SUCCESS" "$(t rs_complete)"
     send_telegram_message "$telegram_msg" >/dev/null 2>&1
-    read -rp "$(t press_enter_back)"
+    ui_pause "$(t press_enter_back)"
 }
 
 update_script() {
@@ -2352,7 +2625,7 @@ update_script() {
     echo ""
     if [[ "$EUID" -ne 0 ]]; then
         echo -e "${RED}⛔ $(t upd_root)${RESET}"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     fi
 
@@ -2363,7 +2636,7 @@ update_script() {
     if ! curl -fsSL "$SCRIPT_REPO_URL" 2>/dev/null | head -n 100 > "$TEMP_REMOTE_VERSION_FILE"; then
         print_message "ERROR" "$(t upd_fetch_fail)"
         rm -f "$TEMP_REMOTE_VERSION_FILE"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     fi
 
@@ -2372,7 +2645,7 @@ update_script() {
 
     if [[ -z "$REMOTE_VERSION" ]]; then
         print_message "ERROR" "$(t upd_parse_fail)"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     fi
 
@@ -2417,12 +2690,12 @@ update_script() {
 
         if [[ "${confirm_update,,}" != "y" ]]; then
             print_message "WARN" "$(t upd_cancelled)"
-            read -rp "$(t press_enter)"
+            ui_pause
             return
         fi
     else
         print_message "INFO" "$(t upd_latest)"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     fi
 
@@ -2430,14 +2703,14 @@ update_script() {
     print_message "INFO" "$(t upd_downloading)"
     if ! curl -fsSL "$SCRIPT_REPO_URL" -o "$TEMP_SCRIPT_PATH"; then
         print_message "ERROR" "$(t upd_download_fail)"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     fi
 
     if [[ ! -s "$TEMP_SCRIPT_PATH" ]] || ! head -n 1 "$TEMP_SCRIPT_PATH" | grep -q -e '^#!.*bash'; then
         print_message "ERROR" "$(t upd_invalid_file)"
         rm -f "$TEMP_SCRIPT_PATH"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     fi
 
@@ -2452,7 +2725,7 @@ update_script() {
     cp "$SCRIPT_PATH" "$BACKUP_PATH_SCRIPT" || {
         echo -e "${RED}❌ $(t upd_bak_fail)${RESET}"
         rm -f "$TEMP_SCRIPT_PATH"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     }
     echo ""
@@ -2462,7 +2735,7 @@ update_script() {
         echo -e "${YELLOW}⚠️ $(t upd_restoring_bak)${RESET}"
         mv "$BACKUP_PATH_SCRIPT" "$SCRIPT_PATH"
         rm -f "$TEMP_SCRIPT_PATH"
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     }
 
@@ -2470,7 +2743,7 @@ update_script() {
     print_message "SUCCESS" "$(t upd_done) ${BOLD}${GREEN}${REMOTE_VERSION}${RESET}."
     echo ""
     print_message "INFO" "$(t upd_restart)"
-    read -rp "$(t press_enter_restart)"
+    ui_pause "$(t press_enter_restart)"
     exec "$SCRIPT_PATH" "$@"
     exit 0
 }
@@ -2482,21 +2755,20 @@ remove_script() {
     echo  " - $(t rm_symlink)"
     echo  " - $(t rm_cron)"
     echo ""
-    echo -e -n "$(t rm_confirm) ${GREEN}${BOLD}Y${RESET}/${RED}${BOLD}N${RESET}: "
-    read -r confirm
-    echo ""
-    
-    if [[ "${confirm,,}" != "y" ]]; then
-    print_message "WARN" "$(t rm_cancelled)"
-    read -rp "$(t press_enter)"
-    return
+    if ! ui_confirm "$(t rm_confirm)"; then
+        print_message "WARN" "$(t rm_cancelled)"
+        ui_pause
+        return
     fi
+    echo ""
 
     if [[ "$EUID" -ne 0 ]]; then
         print_message "WARN" "$(t rm_root) ${BOLD}sudo${RESET}."
-        read -rp "$(t press_enter)"
+        ui_pause
         return
     fi
+
+    stop_telegram_listener
 
     print_message "INFO" "$(t rm_cron_removing)"
     if crontab -l 2>/dev/null | grep -qF "$SCRIPT_PATH backup"; then
@@ -2528,18 +2800,10 @@ remove_script() {
 
 configure_upload_method() {
     while true; do
-        clear
-        echo -e "${GREEN}${BOLD}$(t ul_title)${RESET}"
-        echo ""
+        ui_header "$(t ul_title)"
         print_message "INFO" "$(t ul_current) ${BOLD}${UPLOAD_METHOD^^}${RESET}"
-        echo ""
-        echo "   1. $(t ul_set_tg)"
-        echo "   2. $(t ul_set_gd)"
-        echo "   3. $(t ul_set_s3)"
-        echo ""
-        echo "   0. $(t back_to_menu)"
-        echo ""
-        read -rp "${GREEN}[?]${RESET} $(t select_option)" choice
+        local choice
+        choice=$(ui_pick_index "$(t select_option)" "$(t ul_set_tg)" "$(t ul_set_gd)" "$(t ul_set_s3)" "$(t back_to_menu)")
         echo ""
 
         case $choice in
@@ -2629,7 +2893,7 @@ configure_upload_method() {
                 if ! install_aws_cli; then
                     print_message "WARN" "$(t ul_s3_aws_needed)"
                     echo ""
-                    read -rp "$(t press_enter)"
+                    ui_pause
                     continue
                 fi
                 
@@ -2672,20 +2936,18 @@ configure_upload_method() {
                     print_message "SUCCESS" "$(t ul_tg_set)"
                 fi
                 ;;
-            0) break ;;
+            4) break ;;
             *) print_message "ERROR" "$(t invalid_input_select)" ;;
         esac
         echo ""
-        read -rp "$(t press_enter)"
+        ui_pause
     done
     echo ""
 }
 
 configure_settings() {
     while true; do
-        clear
-        echo -e "${GREEN}${BOLD}$(t st_title)${RESET}"
-        echo ""
+        ui_header "$(t st_title)"
         echo "   1. $(t st_tg_settings)"
         echo "   2. $(t st_gd_settings)"
         echo "   3. $(t st_s3_settings)"
@@ -2710,12 +2972,14 @@ configure_settings() {
                     print_message "INFO" "$(t st_tg_chatid) ${BOLD}${CHAT_ID}${RESET}"
                     print_message "INFO" "$(t st_tg_thread) ${BOLD}${TG_MESSAGE_THREAD_ID:-$(t not_set)}${RESET}"
                     print_message "INFO" "$(t st_tg_proxy) ${BOLD}${TG_PROXY:-$(t not_set)}${RESET}"
+                    print_message "INFO" "$(t st_tg_admins) ${BOLD}${TG_ADMIN_IDS:-$(t not_set)}${RESET}"
                     echo ""
                     echo ""
                     echo "   1. $(t st_tg_change_token)"
                     echo "   2. $(t st_tg_change_id)"
                     echo "   3. $(t st_tg_change_thread)"
                     echo "   4. $(t st_tg_change_proxy)"
+                    echo "   5. $(t st_tg_change_admins)"
                     echo ""
                     echo "   0. $(t back)"
                     echo ""
@@ -2750,7 +3014,7 @@ configure_settings() {
                             print_message "INFO" "$(t st_tg_proxy_info)"
                             print_message "INFO" "$(t st_tg_proxy_examples)"
                             echo ""
-                            read -rp "   $(t st_tg_enter_proxy)" NEW_TG_PROXY
+                            NEW_TG_PROXY=$(ui_input "$(t st_tg_enter_proxy)")
                             TG_PROXY="$NEW_TG_PROXY"
                             save_config
                             if [[ -n "$TG_PROXY" ]]; then
@@ -2759,11 +3023,19 @@ configure_settings() {
                                 print_message "SUCCESS" "$(t st_tg_proxy_cleared)"
                             fi
                             ;;
+                        5)
+                            print_message "INFO" "$(t st_tg_admins_info)"
+                            NEW_TG_ADMIN_IDS=$(ui_input "$(t st_tg_enter_admins)")
+                            TG_ADMIN_IDS="$NEW_TG_ADMIN_IDS"
+                            save_config
+                            print_message "SUCCESS" "$(t st_tg_admins_ok)"
+                            ensure_telegram_listener
+                            ;;
                         0) break ;;
                         *) print_message "ERROR" "$(t invalid_input_select)" ;;
                     esac
                     echo ""
-                    read -rp "$(t press_enter)"
+                    ui_pause
                 done
                 ;;
 
@@ -2853,7 +3125,7 @@ configure_settings() {
                         *) print_message "ERROR" "$(t invalid_input_select)" ;;
                     esac
                     echo ""
-                    read -rp "$(t press_enter)"
+                    ui_pause
                 done
                 ;;
 
@@ -2948,7 +3220,7 @@ configure_settings() {
                         *) print_message "ERROR" "$(t invalid_input_select)" ;;
                     esac
                     echo ""
-                    read -rp "$(t press_enter)"
+                    ui_pause
                 done
                 ;;
 
@@ -3082,7 +3354,7 @@ configure_settings() {
                         *) print_message "ERROR" "$(t invalid_input)" ;;
                     esac
                     echo ""
-                    read -rp "$(t press_enter)"
+                    ui_pause
                 done
                 ;;
 
@@ -3116,14 +3388,14 @@ configure_settings() {
                         if [[ -z "$new_custom_remnawave_path" ]]; then
                             print_message "ERROR" "$(t cfg_path_empty)"
                             echo ""
-                            read -rp "$(t press_enter)"
+                            ui_pause
                             continue
                         fi
         
                         if [[ ! "$new_custom_remnawave_path" = /* ]]; then
                             print_message "ERROR" "$(t cfg_path_abs)"
                             echo ""
-                            read -rp "$(t press_enter)"
+                            ui_pause
                             continue
                         fi
         
@@ -3134,7 +3406,7 @@ configure_settings() {
                             read -rp "$(echo -e "${GREEN}[?]${RESET} $(t st_path_continue) ${GREEN}${BOLD}Y${RESET}/${RED}${BOLD}N${RESET}: ")" confirm_new_custom_path
                             if [[ "$confirm_new_custom_path" != "y" ]]; then
                                 echo ""
-                                read -rp "$(t press_enter)"
+                                ui_pause
                                 continue
                             fi
                         fi
@@ -3152,7 +3424,7 @@ configure_settings() {
                 save_config
                 print_message "SUCCESS" "$(t st_path_ok) ${BOLD}${REMNALABS_ROOT_DIR}${RESET}."
                 echo ""
-                read -rp "$(t press_enter)"
+                ui_pause
                 ;;
 
             6)
@@ -3187,7 +3459,7 @@ configure_settings() {
                     *) print_message "ERROR" "$(t invalid_input_select)" ;;
                 esac
                 echo ""
-                read -rp "$(t press_enter)"
+                ui_pause
                 ;;
 
             7)
@@ -3200,7 +3472,7 @@ configure_settings() {
                 save_config
                 print_message "SUCCESS" "$(t st_lang_changed) ${BOLD}${LANG_CODE}${RESET}"
                 echo ""
-                read -rp "$(t press_enter)"
+                ui_pause
                 ;;
 
             8)
@@ -3235,10 +3507,10 @@ configure_settings() {
                     *) print_message "ERROR" "$(t invalid_input_select)" ;;
                 esac
                 echo ""
-                read -rp "$(t press_enter)"
+                ui_pause
                 ;;
 
-            0) break ;;
+            9) break ;;
             *) print_message "ERROR" "$(t invalid_input_select)" ;;
         esac
         echo ""
@@ -3303,39 +3575,34 @@ check_update_status() {
 main_menu() {
     while true; do
         check_update_status
-        clear
-        echo -e "${GREEN}${BOLD}$(t menu_title)${RESET} "
+        ui_header "$(t menu_title)"
+        local status_lines=""
         if [[ "$UPDATE_AVAILABLE" == true ]]; then
-            echo -e "${BOLD}${LIGHT_GRAY}$(t menu_version) ${VERSION} ${RED}$(t menu_update_avail)${RESET}"
+            status_lines+="$(t menu_version) ${VERSION} $(t menu_update_avail)"$'\n'
         else
-            echo -e "${BOLD}${LIGHT_GRAY}$(t menu_version) ${VERSION}${RESET}"
+            status_lines+="$(t menu_version) ${VERSION}"$'\n'
         fi
-        
         if [[ "$DB_CONNECTION_TYPE" == "external" ]]; then
-            echo -e "${LIGHT_GRAY}$(t menu_db_ext) (${DB_HOST}:${DB_PORT})${RESET}"
+            status_lines+="$(t menu_db_ext) (${DB_HOST}:${DB_PORT})"
         else
-            echo -e "${LIGHT_GRAY}$(t menu_db_docker)${RESET}"
+            status_lines+="$(t menu_db_docker)"
         fi
+        ui_format "$status_lines"
         echo ""
-        echo "   1. $(t menu_create_backup)"
-        echo "   2. $(t menu_restore)"
-        echo ""
-        echo "   3. $(t menu_bot_backup)"
-        echo "   4. $(t menu_auto_send)"
-        echo "   5. $(t menu_upload_method)"
-        echo "   6. $(t menu_settings)"
-        echo ""
-        echo "   7. $(t menu_update)"
-        echo "   8. $(t menu_remove)"
-        echo ""
-        echo "   0. $(t exit)"
-        echo -e "   —  $(t menu_shortcut)"
-        echo ""
-
-        read -rp "${GREEN}[?]${RESET} $(t select_option)" choice
+        local choice
+        choice=$(ui_pick_index "$(t select_option)" \
+            "$(t menu_create_backup)" \
+            "$(t menu_restore)" \
+            "$(t menu_bot_backup)" \
+            "$(t menu_auto_send)" \
+            "$(t menu_upload_method)" \
+            "$(t menu_settings)" \
+            "$(t menu_update)" \
+            "$(t menu_remove)" \
+            "$(t exit)")
         echo ""
         case $choice in
-            1) create_backup ; read -rp "$(t press_enter)" ;;
+            1) create_backup; ui_pause ;;
             2) restore_backup ;;
             3) configure_bot_backup ;;
             4) setup_auto_send ;;
@@ -3343,8 +3610,8 @@ main_menu() {
             6) configure_settings ;;
             7) update_script ;;
             8) remove_script ;;
-            0) echo "$(t exit_dots)"; exit 0 ;;
-            *) print_message "ERROR" "$(t invalid_input_select)" ; read -rp "$(t press_enter)" ;;
+            9) echo "$(t exit_dots)"; exit 0 ;;
+            *) print_message "ERROR" "$(t invalid_input_select)"; ui_pause ;;
         esac
     done
 }
@@ -3366,6 +3633,7 @@ if ! command -v jq &> /dev/null; then
 fi
 
 if [[ -z "$1" ]]; then
+    ensure_gum
     load_or_create_config
     setup_symlink
     main_menu
@@ -3376,12 +3644,18 @@ elif [[ "$1" == "restore" ]]; then
     load_or_create_config
     restore_backup
 elif [[ "$1" == "update" ]]; then
+    ensure_gum
     load_or_create_config
     update_script
 elif [[ "$1" == "remove" ]]; then
+    ensure_gum
     load_or_create_config
     remove_script
+elif [[ "$1" == "listen" ]]; then
+    RW_RUNNING_MODE="listen"
+    load_or_create_config
+    telegram_listener_loop
 else
-    echo -e "${RED}❌ $(t jq_bad_usage) ${BOLD}${0} [backup|restore|update|remove]${RESET}${RESET}"
+    echo -e "${RED}❌ $(t jq_bad_usage) ${BOLD}${0} [backup|restore|update|remove|listen]${RESET}${RESET}"
     exit 1
 fi
