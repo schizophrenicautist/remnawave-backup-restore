@@ -77,6 +77,46 @@ t() {
     fi
 }
 
+sync_bundled_translations() {
+    local script_dir bundled
+    script_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+    bundled="$script_dir/translations"
+    if [[ -f "$bundled/en.sh" && -f "$bundled/ru.sh" ]]; then
+        mkdir -p "$TRANSLATIONS_DIR"
+        cp -f "$bundled/en.sh" "$bundled/ru.sh" "$TRANSLATIONS_DIR/"
+    fi
+}
+
+apply_tg_translation_defaults() {
+    local lang="${LANG_CODE:-ru}"
+    if [[ "$lang" == "en" ]]; then
+        [[ -n "${L[tg_btn_backup_now]+x}" ]] || L[tg_btn_backup_now]="📦 Create another backup"
+        [[ -n "${L[tg_admin_denied]+x}" ]] || L[tg_admin_denied]="Only administrators can trigger backups."
+        [[ -n "${L[tg_backup_started]+x}" ]] || L[tg_backup_started]="Backup started"
+        [[ -n "${L[tg_backup_in_progress]+x}" ]] || L[tg_backup_in_progress]="Backup in progress..."
+    else
+        [[ -n "${L[tg_btn_backup_now]+x}" ]] || L[tg_btn_backup_now]="📦 Создать ещё один бэкап"
+        [[ -n "${L[tg_admin_denied]+x}" ]] || L[tg_admin_denied]="Только администраторы могут запускать бэкап."
+        [[ -n "${L[tg_backup_started]+x}" ]] || L[tg_backup_started]="Бэкап запущен"
+        [[ -n "${L[tg_backup_in_progress]+x}" ]] || L[tg_backup_in_progress]="Бэкап выполняется..."
+    fi
+}
+
+tg_msg() {
+    local key="$1" val
+    val=$(t "$key")
+    if [[ "$val" == "$key" ]]; then
+        apply_tg_translation_defaults
+        val=$(t "$key")
+    fi
+    echo "$val"
+}
+
+tg_log() {
+    mkdir -p "$INSTALL_DIR"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >>"$INSTALL_DIR/tg_listener.log"
+}
+
 ui_can_gum() {
     $UI_INTERACTIVE && command -v gum &>/dev/null
 }
@@ -239,12 +279,14 @@ download_translations() {
 
 load_language() {
     local lang="${1:-ru}"
+    sync_bundled_translations
     local lang_file="$TRANSLATIONS_DIR/${lang}.sh"
     if [[ -f "$lang_file" ]]; then
         source "$lang_file"
     elif [[ -f "$TRANSLATIONS_DIR/ru.sh" ]]; then
         source "$TRANSLATIONS_DIR/ru.sh"
     fi
+    apply_tg_translation_defaults
 }
 
 select_language_interactive() {
@@ -1322,10 +1364,10 @@ restore_panel_db_dump() {
 
 
 resolve_script_path() {
-    if [[ -x "$SCRIPT_PATH" ]]; then
-        echo "$SCRIPT_PATH"
-    elif [[ -n "$SCRIPT_RUN_PATH" && -x "$SCRIPT_RUN_PATH" ]]; then
+    if [[ -n "$SCRIPT_RUN_PATH" && -x "$SCRIPT_RUN_PATH" ]]; then
         echo "$SCRIPT_RUN_PATH"
+    elif [[ -x "$SCRIPT_PATH" ]]; then
+        echo "$SCRIPT_PATH"
     else
         realpath "${BASH_SOURCE[0]}"
     fi
@@ -1334,24 +1376,33 @@ resolve_script_path() {
 build_backup_inline_markup() {
     local extra_json="${1:-}"
     local btn_text
-    btn_text=$(t tg_btn_backup_now)
+    btn_text=$(tg_msg tg_btn_backup_now)
     if [[ -n "$extra_json" ]]; then
-        jq -n             --arg text "$btn_text"             --arg data "$TG_CALLBACK_BACKUP"             --argjson extra "$extra_json"             '($extra.inline_keyboard // []) + [[{text: $text, callback_data: $data}]] | {inline_keyboard: .}'
+        jq -n \
+            --arg text "$btn_text" \
+            --arg data "$TG_CALLBACK_BACKUP" \
+            --argjson extra "$extra_json" \
+            '($extra.inline_keyboard // []) + [[{text: $text, callback_data: $data}]] | {inline_keyboard: .}'
     else
-        jq -n             --arg text "$btn_text"             --arg data "$TG_CALLBACK_BACKUP"             '{inline_keyboard: [[{text: $text, callback_data: $data}]]}'
+        jq -n \
+            --arg text "$btn_text" \
+            --arg data "$TG_CALLBACK_BACKUP" \
+            '{inline_keyboard: [[{text: $text, callback_data: $data}]]}'
     fi
 }
 
 is_telegram_admin() {
     local user_id="$1"
     local chat_id="$2"
+    tg_log "admin check user_id=${user_id} chat_id=${chat_id} TG_ADMIN_IDS=${TG_ADMIN_IDS:-empty} CHAT_ID=${CHAT_ID}"
     if [[ -n "$TG_ADMIN_IDS" ]]; then
         local id
         IFS=',' read -ra admin_list <<< "$TG_ADMIN_IDS"
         for id in "${admin_list[@]}"; do
             id="${id// /}"
-            [[ -n "$id" && "$id" == "$user_id" ]] && return 0
+            [[ -n "$id" && "$id" == "$user_id" ]] && { tg_log "admin allowed via TG_ADMIN_IDS"; return 0; }
         done
+        tg_log "admin denied: not in TG_ADMIN_IDS"
         return 1
     fi
     if [[ "$chat_id" =~ ^- ]]; then
@@ -1361,10 +1412,15 @@ is_telegram_admin() {
             -d "chat_id=${chat_id}" \
             -d "user_id=${user_id}")
         status=$(echo "$response" | jq -r '.result.status // empty')
+        tg_log "getChatMember status=${status} response=${response}"
         [[ "$status" == "creator" || "$status" == "administrator" ]] && return 0
         return 1
     fi
-    [[ "$user_id" == "${CHAT_ID// /}" ]] && return 0
+    if [[ "$user_id" == "${CHAT_ID// /}" ]]; then
+        tg_log "admin allowed: private chat owner"
+        return 0
+    fi
+    tg_log "admin denied: user_id mismatch (expected CHAT_ID=${CHAT_ID})"
     return 1
 }
 
@@ -1372,62 +1428,75 @@ answer_callback_query() {
     local callback_id="$1"
     local text="${2:-}"
     local show_alert="${3:-false}"
+    local response
     if [[ -n "$text" ]]; then
-        curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
+        response=$(curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
             "https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery" \
             --data-urlencode "callback_query_id=${callback_id}" \
             --data-urlencode "text=${text}" \
-            --data-urlencode "show_alert=${show_alert}" >/dev/null
+            --data-urlencode "show_alert=${show_alert}")
     else
-        curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
+        response=$(curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
             "https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery" \
             -d "callback_query_id=${callback_id}" \
-            -d "show_alert=${show_alert}" >/dev/null
+            -d "show_alert=${show_alert}")
     fi
+    tg_log "answerCallbackQuery callback_id=${callback_id} response=${response}"
 }
 
 handle_telegram_callback() {
     local update="$1"
-    local callback_id user_id chat_id data script_path
+    local callback_id user_id chat_id data script_path backup_pid
     callback_id=$(echo "$update" | jq -r '.callback_query.id')
     user_id=$(echo "$update" | jq -r '.callback_query.from.id')
     chat_id=$(echo "$update" | jq -r '.callback_query.message.chat.id')
     data=$(echo "$update" | jq -r '.callback_query.data')
-    [[ "$data" != "$TG_CALLBACK_BACKUP" ]] && return
+    tg_log "callback received id=${callback_id} user=${user_id} chat=${chat_id} data=${data}"
+    [[ "$data" != "$TG_CALLBACK_BACKUP" ]] && { tg_log "ignored: unknown callback data"; return; }
     if ! is_telegram_admin "$user_id" "$chat_id"; then
-        answer_callback_query "$callback_id" "$(t tg_admin_denied)" "true"
+        answer_callback_query "$callback_id" "$(tg_msg tg_admin_denied)" "true"
         return
     fi
-    answer_callback_query "$callback_id" "$(t tg_backup_started)" "false"
-    send_telegram_message "🔄 $(t tg_backup_in_progress)" "None" >/dev/null 2>&1 || true
+    answer_callback_query "$callback_id" "$(tg_msg tg_backup_started)" "false"
+    send_telegram_message "🔄 $(tg_msg tg_backup_in_progress)" "None" >/dev/null 2>&1 || true
     script_path=$(resolve_script_path)
+    tg_log "spawning backup via ${script_path}"
     (
         export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
         "$script_path" backup
     ) >>"$INSTALL_DIR/tg_listener.log" 2>&1 &
+    backup_pid=$!
+    tg_log "backup pid=${backup_pid}"
 }
 
 telegram_listener_loop() {
     set +e
     mkdir -p "$INSTALL_DIR"
-    curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
+    tg_log "listener started pid=$$ script=$(resolve_script_path) version=${VERSION}"
+    local wh_response
+    wh_response=$(curl -s -X POST ${TG_PROXY:+--proxy "$TG_PROXY"} \
         "https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook" \
-        -d drop_pending_updates=false >/dev/null 2>&1
+        -d drop_pending_updates=false)
+    tg_log "deleteWebhook response=${wh_response}"
     local offset=0
     [[ -f "$TG_LISTENER_OFFSET_FILE" ]] && offset=$(cat "$TG_LISTENER_OFFSET_FILE" 2>/dev/null || echo 0)
+    tg_log "polling from offset=${offset}"
     while true; do
-        local updates count i update update_id ok
+        local updates count i update update_id ok desc
         updates=$(curl -s ${TG_PROXY:+--proxy "$TG_PROXY"} \
             "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates" \
             -d "offset=${offset}" \
             -d "timeout=25")
         ok=$(echo "$updates" | jq -r '.ok // false')
         if [[ "$ok" != "true" ]]; then
+            desc=$(echo "$updates" | jq -r '.description // empty')
+            tg_log "getUpdates failed ok=${ok} description=${desc} body=${updates}"
             sleep 5
             continue
         fi
         count=$(echo "$updates" | jq -r '.result | length // 0')
         [[ "$count" == "0" || -z "$count" ]] && continue
+        tg_log "received ${count} update(s)"
         for ((i = 0; i < count; i++)); do
             update=$(echo "$updates" | jq -c ".result[$i]")
             update_id=$(echo "$update" | jq -r '.update_id')
@@ -1435,6 +1504,8 @@ telegram_listener_loop() {
             echo "$offset" > "$TG_LISTENER_OFFSET_FILE"
             if echo "$update" | jq -e '.callback_query' >/dev/null 2>&1; then
                 handle_telegram_callback "$update"
+            else
+                tg_log "skipped update_id=${update_id} (not a callback_query)"
             fi
         done
     done
@@ -1449,14 +1520,17 @@ ensure_telegram_listener() {
     if [[ -f "$TG_LISTENER_PID_FILE" ]]; then
         pid=$(cat "$TG_LISTENER_PID_FILE" 2>/dev/null)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            tg_log "listener already running pid=${pid}"
             return 0
         fi
         rm -f "$TG_LISTENER_PID_FILE"
     fi
+    tg_log "starting listener script=${script_path}"
     nohup env RW_RUNNING_MODE=listen \
         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH" \
         "$script_path" listen >>"$listener_log" 2>&1 &
     echo $! >"$TG_LISTENER_PID_FILE"
+    tg_log "listener spawned pid=$!"
 }
 
 stop_telegram_listener() {
@@ -1464,6 +1538,7 @@ stop_telegram_listener() {
         local pid
         pid=$(cat "$TG_LISTENER_PID_FILE" 2>/dev/null)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            tg_log "stopping listener pid=${pid}"
             kill "$pid" 2>/dev/null || true
         fi
         rm -f "$TG_LISTENER_PID_FILE"
